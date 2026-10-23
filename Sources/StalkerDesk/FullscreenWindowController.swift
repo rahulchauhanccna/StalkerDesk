@@ -57,6 +57,8 @@ final class FullscreenWindowController: NSObject {
         newWindow.isOpaque = true
         newWindow.hasShadow = false
         newWindow.isMovable = false
+        newWindow.acceptsMouseMovedEvents = true
+        newWindow.ignoresMouseEvents = false
         newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         newWindow.setFrame(screen.frame, display: true)
 

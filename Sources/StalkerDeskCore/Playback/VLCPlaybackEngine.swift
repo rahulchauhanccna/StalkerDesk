@@ -27,6 +27,7 @@ final class VLCPlaybackEngine: NSObject, PlaybackEngine {
 
     private let player = VLCMediaPlayer()
     private var lastState: PlaybackState = .idle
+    private var startTime: Double?
 
     var pipAvailable: Bool { false }
     var pipActive: Bool { false }
@@ -55,12 +56,16 @@ final class VLCPlaybackEngine: NSObject, PlaybackEngine {
         }
 
         player.media = media
+        startTime = request.startTime
         lastState = .preparing
         delegate?.engine(self, didChangeState: .preparing)
     }
 
     func play() {
         player.play()
+        if let startTime, startTime > 1 {
+            player.time = VLCTime(int: Int32(startTime * 1000))
+        }
     }
 
     func pause() {

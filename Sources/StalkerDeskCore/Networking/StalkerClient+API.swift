@@ -240,18 +240,9 @@ public extension StalkerClient {
     /// common Stalker VOD create_link variants.
     func resolveStream(for media: StalkerMediaItem) async throws -> ResolvedStream {
         var lastError: Error?
+        var triedItemCommand = false
 
-        // 1. Some portals put the playable cmd directly on the VOD item.
-        if !media.command.isEmpty {
-            do {
-                let command = try await createVODLink(command: media.command)
-                return try makeVODStream(from: command, media: media)
-            } catch {
-                lastError = error
-            }
-        }
-
-        // 2. Series episodes: get_episode_stream is supported by several
+        // 1. Series episodes: get_episode_stream is supported by several
         //    Ministra builds.
         if media.kind == .episode {
             do {
@@ -262,11 +253,47 @@ public extension StalkerClient {
             }
         }
 
-        // 3. Fallback: get_ordered_list returns a stream record; create_link
-        //    with /media/file_<id>.mpg is the legacy VOD convention.
+        // 2. A cmd that already points at a concrete stream can be passed
+        //    straight to create_link. A "/media/<id>.mpg" catalog command is
+        //    only a VOD record reference on many portals and returns
+        //    nothing_to_play, so those go through the record lookup first.
+        let lowerCommand = media.command.lowercased()
+        let commandLooksPlayable = lowerCommand.hasPrefix("http")
+            || lowerCommand.hasPrefix("ffmpeg")
+            || lowerCommand.contains("/media/file_")
+        if !media.command.isEmpty, commandLooksPlayable {
+            triedItemCommand = true
+            do {
+                let command = try await createVODLink(command: media.command)
+                return try makeVODStream(from: command, media: media)
+            } catch {
+                lastError = error
+            }
+        }
+
+        // 3. Preferred lookup: get_ordered_list returns the actual VOD file
+        //    record; create_link with its id yields the signed HLS URL.
         do {
             let streamID = try await fetchVODStreamID(for: media)
             let command = try await createVODLink(command: "/media/file_\(streamID).mpg")
+            return try makeVODStream(from: command, media: media)
+        } catch {
+            lastError = error
+        }
+
+        // 4. Last chance for portals that only accept the item cmd or the
+        //    catalog id as a legacy file reference.
+        if !media.command.isEmpty, !triedItemCommand {
+            do {
+                let command = try await createVODLink(command: media.command)
+                return try makeVODStream(from: command, media: media)
+            } catch {
+                lastError = error
+            }
+        }
+
+        do {
+            let command = try await createVODLink(command: "/media/file_\(media.id).mpg")
             return try makeVODStream(from: command, media: media)
         } catch {
             lastError = error
@@ -317,6 +344,9 @@ public extension StalkerClient {
             URLQueryItem(name: "action", value: "get_ordered_list"),
             URLQueryItem(name: "movie_id", value: media.movieID ?? media.id)
         ]
+        if let categoryID = media.categoryID, !categoryID.isEmpty {
+            items.append(URLQueryItem(name: "category", value: categoryID))
+        }
         if let seasonID = media.seasonID, !seasonID.isEmpty {
             items.append(URLQueryItem(name: "season_id", value: seasonID))
         }
@@ -326,10 +356,18 @@ public extension StalkerClient {
 
         let json = try await requestJSON(items: items, authenticated: true)
         let js = try Self.jsPayload(json)
-        let values = js["data"]?.arrayValue ?? js.arrayValue ?? []
+        let values: [JSONValue]
+        if let array = js["data"]?.arrayValue {
+            values = array
+        } else if let object = js["data"]?.objectValue {
+            values = [.object(object)]
+        } else {
+            values = js.arrayValue ?? []
+        }
         guard let first = values.first?.objectValue,
-              let streamID = first.firstString("id", "video_id", "episode_id") else {
-            throw StalkerError.createLinkFailed("The portal returned no playable VOD record.")
+              let streamID = first.firstString("id", "video_id", "episode_id"),
+              !streamID.isEmpty, streamID != "0" else {
+            throw StalkerError.createLinkFailed("The portal has no playable source for this title.")
         }
         return streamID
     }

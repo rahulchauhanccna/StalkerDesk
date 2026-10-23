@@ -15,6 +15,8 @@ A native macOS IPTV and on-demand client for Stalker / Ministra middleware porta
 - **Live EPG** — bulk `get_epg_info` with `get_short_epg` fallback, live progress and "up next".
 - **Movies and series** — VOD categories, poster/thumbnail grid, movie playback, series seasons, episode lists, and episode playback (`get_categories`, `get_ordered_list`, `create_link`, `get_episode_stream`).
 - **Artwork and sorting** — Stalker `screenshot_uri` thumbnails and sorting by recently added, title, year, or rating.
+- **Resume playback** — movies and series episodes remember their last position and offer Resume / Continue Watching.
+- **Fullscreen polish** — controls auto-hide during playback and a seek/progress bar is available for VOD.
 - **Stream resolution** — `create_link`, localhost rewriting, cookie/Authorization/Referer injection into playback.
 - **Native playback** — AVPlayer with PiP, fullscreen, aspect ratio (16:9 / fit / zoom), keyboard channel switching, automatic VLCKit fallback for raw MPEG-TS when VLCKit is linked.
 - **macOS-native persistence** — Core Data for profiles (Ventura-compatible; SwiftData requires macOS 14) and the macOS Keychain for passwords and resumable session tokens.

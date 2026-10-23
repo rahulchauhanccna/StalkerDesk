@@ -421,6 +421,10 @@ struct MediaDetailPane: View {
             ? String(format: "%d:%02d:%02d", hours, minutes, secs)
             : String(format: "%02d:%02d", minutes, secs)
     }
+
+    private func formatTime(_ seconds: Double) -> String {
+        timeLabel(seconds)
+    }
 }
 
 private struct MediaMetadataView: View {
@@ -478,14 +482,28 @@ private struct MediaMetadataView: View {
                         }
 
                         if media.isMovie {
-                            Button {
-                                appState.playSelectedMedia()
-                            } label: {
-                                Label(player.currentRequest?.channelID == media.id ? "Restart Movie" : "Play Movie",
-                                      systemImage: "play.fill")
+                            let resume = appState.resumePosition(for: media)
+                            HStack(spacing: 10) {
+                                Button {
+                                    appState.playSelectedMedia(useResume: resume != nil)
+                                } label: {
+                                    Label(
+                                        resume.map { "Resume from \(formatTime($0))" }
+                                            ?? (player.currentRequest?.channelID == media.id ? "Restart Movie" : "Play Movie"),
+                                        systemImage: "play.fill"
+                                    )
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.large)
+
+                                if resume != nil {
+                                    Button("Start Over") {
+                                        appState.playSelectedMedia(useResume: false)
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .controlSize(.large)
+                                }
                             }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.large)
                         }
                     }
                     Spacer(minLength: 0)
@@ -503,6 +521,56 @@ private struct MediaMetadataView: View {
 
     @ViewBuilder
     private func seriesDetail(media: StalkerMediaItem) -> some View {
+        if let resume = appState.latestResume(for: media) {
+            Button {
+                appState.resumeLatest(for: media)
+            } label: {
+                HStack(spacing: 14) {
+                    ZStack {
+                        Circle()
+                            .fill(Color.accentColor.opacity(0.2))
+                        Image(systemName: "play.fill")
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .frame(width: 38, height: 38)
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Continue watching")
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                        Text(resume.title)
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                    }
+
+                    Spacer()
+
+                    Text(resume.timeLabel)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .padding(13)
+                .background(
+                    LinearGradient(
+                        colors: [Color.accentColor.opacity(0.14), Color(nsColor: .controlBackgroundColor)],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    ),
+                    in: RoundedRectangle(cornerRadius: 10)
+                )
+                .overlay {
+                    RoundedRectangle(cornerRadius: 10)
+                        .strokeBorder(Color.accentColor.opacity(0.25))
+                }
+            }
+            .buttonStyle(.plain)
+        }
+
         Divider()
 
         if appState.isLoadingSeriesDetail && appState.seasons.isEmpty {
@@ -580,6 +648,17 @@ private struct MediaMetadataView: View {
                 .foregroundStyle(.secondary)
         }
     }
+
+    private func formatTime(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "00:00" }
+        let total = Int(seconds)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%02d:%02d", minutes, secs)
+    }
 }
 
 private struct EpisodeRow: View {
@@ -633,10 +712,26 @@ struct FullscreenPlayerView: View {
     @EnvironmentObject private var appState: AppState
     let onExit: () -> Void
 
+    @State private var controlsVisible = true
+    @State private var hideTask: Task<Void, Never>?
+
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
             PlayerSurface(player: player)
+
+            // Transparent interaction layer for showing the auto-hiding controls.
+            // It sits above the AVPlayer surface but below the controls.
+            Color.clear
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    revealControls()
+                }
+                .onContinuousHover { phase in
+                    if case .active = phase {
+                        revealControls()
+                    }
+                }
 
             if appState.isResolvingStream || player.state == .preparing || player.state == .buffering {
                 ProgressView()
@@ -668,119 +763,208 @@ struct FullscreenPlayerView: View {
                 .background(.black.opacity(0.7), in: RoundedRectangle(cornerRadius: 14))
             }
 
-            VStack {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(player.currentRequest?.title ?? "Arya IPTV Portal")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(.white)
-                        Text(player.currentRequest?.subtitle ?? "")
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.6))
-                    }
-                    Spacer()
-                    Button {
-                        onExit()
-                    } label: {
-                        Label("Exit Fullscreen", systemImage: "xmark")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 7)
-                            .background(.white.opacity(0.14), in: Capsule())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Exit fullscreen")
-                }
-                .padding(20)
-                .background(
-                    LinearGradient(
-                        colors: [.black.opacity(0.75), .black.opacity(0)],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                )
+            VStack(spacing: 0) {
+                topOverlay
+                    .opacity(controlsVisible ? 1 : 0)
+                    .allowsHitTesting(controlsVisible)
 
                 Spacer()
 
-                HStack(spacing: 16) {
-                    Button {
-                        player.togglePlayPause()
-                    } label: {
-                        Image(systemName: player.state == .playing ? "pause.fill" : "play.fill")
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundStyle(.white)
-                            .frame(width: 34, height: 34)
-                    }
-                    .buttonStyle(.plain)
+                bottomOverlay
+                    .opacity(controlsVisible ? 1 : 0)
+                    .allowsHitTesting(controlsVisible)
+            }
+            .animation(.easeInOut(duration: 0.22), value: controlsVisible)
+        }
+        .ignoresSafeArea()
+        .onAppear {
+            scheduleHide()
+        }
+        .onDisappear {
+            hideTask?.cancel()
+        }
+        .onChange(of: player.state) { state in
+            if state == .playing {
+                scheduleHide()
+            } else {
+                controlsVisible = true
+                hideTask?.cancel()
+            }
+        }
+    }
 
-                    Button {
-                        player.toggleMute()
-                    } label: {
-                        Image(systemName: player.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
+    private var topOverlay: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(player.currentRequest?.title ?? "Arya IPTV Portal")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.white)
+                Text(player.currentRequest?.subtitle ?? "")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            Spacer()
+            Button {
+                onExit()
+            } label: {
+                Label("Exit Fullscreen", systemImage: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(.white.opacity(0.14), in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Exit fullscreen")
+        }
+        .padding(20)
+        .background(
+            LinearGradient(
+                colors: [.black.opacity(0.78), .black.opacity(0)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private var bottomOverlay: some View {
+        VStack(spacing: 10) {
+            if player.isLive {
+                HStack(spacing: 8) {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 7, height: 7)
+                    Text("LIVE")
+                        .font(.system(size: 10, weight: .black))
+                        .tracking(0.7)
+                        .foregroundStyle(.white.opacity(0.9))
+                    Text(player.currentRequest?.subtitle ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.55))
+                    Spacer()
+                }
+                .padding(.horizontal, 24)
+            } else {
+                HStack(spacing: 10) {
+                    Text(timeLabel(player.currentTime))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .frame(width: 48, alignment: .trailing)
 
                     Slider(
                         value: Binding(
-                            get: { player.volume },
-                            set: { player.setVolume($0) }
+                            get: { player.currentTime },
+                            set: { player.seek(to: $0) }
                         ),
-                        in: 0...1
+                        in: 0...max(player.duration, 1)
                     )
-                    .frame(width: 100)
-                    .controlSize(.mini)
+                    .controlSize(.small)
 
-                    if !player.isLive {
-                        Slider(
-                            value: Binding(
-                                get: { player.currentTime },
-                                set: { player.seek(to: $0) }
-                            ),
-                            in: 0...max(player.duration, 1)
-                        )
-                        .frame(width: 240)
-                        .controlSize(.mini)
-                    }
-
-                    Spacer()
-
-                    Menu {
-                        ForEach(PlayerAspectRatio.allCases) { ratio in
-                            Button(ratio.displayName) {
-                                player.setAspectRatio(ratio)
-                            }
-                        }
-                    } label: {
-                        Label(player.aspectRatio.displayName, systemImage: player.aspectRatio.symbolName)
-                            .foregroundStyle(.white)
-                    }
-                    .menuStyle(.borderlessButton)
-                    .fixedSize()
-
-                    Button {
-                        player.togglePictureInPicture()
-                    } label: {
-                        Image(systemName: player.isPiPActive ? "pip.exit" : "pip.enter")
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(!player.isPiPAvailable && !player.isPiPActive)
-
-                    Button {
-                        onExit()
-                    } label: {
-                        Image(systemName: "arrow.down.right.and.arrow.up.left")
-                            .foregroundStyle(.white)
-                    }
-                    .buttonStyle(.plain)
+                    Text(timeLabel(player.duration))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.65))
+                        .frame(width: 48, alignment: .leading)
                 }
                 .padding(.horizontal, 24)
-                .padding(.vertical, 14)
-                .background(.black.opacity(0.62))
+            }
+
+            HStack(spacing: 16) {
+                Button {
+                    player.togglePlayPause()
+                } label: {
+                    Image(systemName: player.state == .playing ? "pause.fill" : "play.fill")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 34, height: 34)
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    player.toggleMute()
+                } label: {
+                    Image(systemName: player.isMuted ? "speaker.slash.fill" : "speaker.wave.2.fill")
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+
+                Slider(
+                    value: Binding(
+                        get: { player.volume },
+                        set: { player.setVolume($0) }
+                    ),
+                    in: 0...1
+                )
+                .frame(width: 100)
+                .controlSize(.mini)
+
+                Spacer()
+
+                Menu {
+                    ForEach(PlayerAspectRatio.allCases) { ratio in
+                        Button(ratio.displayName) {
+                            player.setAspectRatio(ratio)
+                        }
+                    }
+                } label: {
+                    Label(player.aspectRatio.displayName, systemImage: player.aspectRatio.symbolName)
+                        .foregroundStyle(.white)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+
+                Button {
+                    player.togglePictureInPicture()
+                } label: {
+                    Image(systemName: player.isPiPActive ? "pip.exit" : "pip.enter")
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+                .disabled(!player.isPiPAvailable && !player.isPiPActive)
+
+                Button {
+                    onExit()
+                } label: {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                        .foregroundStyle(.white)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 14)
+        }
+        .background(
+            LinearGradient(
+                colors: [.black.opacity(0), .black.opacity(0.82)],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+        )
+    }
+
+    private func revealControls() {
+        controlsVisible = true
+        scheduleHide()
+    }
+
+    private func scheduleHide() {
+        hideTask?.cancel()
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, player.state == .playing else { return }
+            withAnimation(.easeInOut(duration: 0.22)) {
+                controlsVisible = false
             }
         }
-        .ignoresSafeArea()
+    }
+
+    private func timeLabel(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds > 0 else { return "00:00" }
+        let total = Int(seconds)
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        return hours > 0
+            ? String(format: "%d:%02d:%02d", hours, minutes, secs)
+            : String(format: "%02d:%02d", minutes, secs)
     }
 }

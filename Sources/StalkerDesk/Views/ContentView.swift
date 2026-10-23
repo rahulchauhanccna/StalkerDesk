@@ -210,9 +210,6 @@ struct ContentView: View {
                         .foregroundStyle(.white.opacity(0.9))
                         .lineLimit(1)
                 }
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 9, weight: .bold))
-                    .foregroundStyle(TVTheme.secondaryText)
             }
             .frame(minWidth: 95, alignment: .leading)
         }
@@ -474,35 +471,66 @@ struct ContentView: View {
 
             if appState.isLoadingMedia {
                 LoadingShelf(label: "Loading \(appState.contentMode.title.lowercased())…")
-            } else if filteredMedia.isEmpty {
-                if appState.isLoadingMoreMedia {
-                    LoadingShelf(label: "Loading more titles…")
-                } else {
-                    TVEmptyState(
-                        symbol: appState.contentMode == .movies ? "film" : "rectangle.stack.badge.play",
-                        title: "Nothing here",
-                        message: "This category has no \(appState.contentMode == .movies ? "movies" : "series") for this portal."
-                    )
-                }
             } else {
-                if appState.isLoadingMoreMedia {
-                    HStack(spacing: 8) {
-                        ProgressView().controlSize(.small)
-                        Text("Loading more titles…")
-                            .font(.system(size: 11))
-                            .foregroundStyle(TVTheme.tertiaryText)
+                if filteredMedia.isEmpty {
+                    if appState.canLoadMoreMedia {
+                        TVEmptyState(
+                            symbol: "rectangle.stack",
+                            title: "No matches on this page",
+                            message: "Load more titles from this category."
+                        )
+                    } else {
+                        TVEmptyState(
+                            symbol: appState.contentMode == .movies ? "film" : "rectangle.stack.badge.play",
+                            title: "Nothing here",
+                            message: "This category has no \(appState.contentMode == .movies ? "movies" : "series") for this portal."
+                        )
+                    }
+                } else {
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 156, maximum: 200), spacing: 16)],
+                        spacing: 16
+                    ) {
+                        ForEach(filteredMedia) { media in
+                            PosterTile(media: media) {
+                                appState.selectMedia(media)
+                            }
+                        }
                     }
                 }
 
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: 156, maximum: 200), spacing: 16)],
-                    spacing: 16
-                ) {
-                    ForEach(filteredMedia) { media in
-                        PosterTile(media: media) {
-                            appState.selectMedia(media)
+                if appState.canLoadMoreMedia {
+                    VStack(spacing: 8) {
+                        if appState.isLoadingMoreMedia {
+                            HStack(spacing: 8) {
+                                ProgressView().controlSize(.small)
+                                Text("Loading more titles…")
+                                    .font(.system(size: 11))
+                                    .foregroundStyle(TVTheme.tertiaryText)
+                            }
+                        } else {
+                            Button {
+                                appState.loadMoreMedia()
+                            } label: {
+                                Label("Load More Titles", systemImage: "plus.circle")
+                                    .font(.system(size: 12, weight: .semibold))
+                                    .foregroundStyle(.white.opacity(0.9))
+                                    .padding(.horizontal, 16)
+                                    .padding(.vertical, 8)
+                                    .background(TVTheme.surface, in: Capsule())
+                                    .overlay {
+                                        Capsule().strokeBorder(TVTheme.hairline, lineWidth: 1)
+                                    }
+                            }
+                            .buttonStyle(.plain)
+
+                            Text("\(appState.mediaItems.count) titles loaded")
+                                .font(.system(size: 10))
+                                .foregroundStyle(TVTheme.tertiaryText)
                         }
                     }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 18)
                 }
             }
         }

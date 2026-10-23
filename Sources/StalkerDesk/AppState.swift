@@ -66,6 +66,8 @@ final class AppState: ObservableObject {
     @Published private(set) var isLoadingChannels = false
     @Published private(set) var isLoadingMedia = false
     @Published private(set) var isLoadingMoreMedia = false
+    @Published private(set) var mediaCurrentPage = 1
+    @Published private(set) var mediaTotalPages = 1
     @Published private(set) var mediaLoadWarning: String?
     @Published private(set) var isLoadingSeriesDetail = false
     @Published private(set) var isLoadingEPG = false
@@ -83,6 +85,7 @@ final class AppState: ObservableObject {
     private var genresTask: Task<Void, Never>?
     private var channelTask: Task<Void, Never>?
     private var mediaTask: Task<Void, Never>?
+    private var mediaPageTask: Task<Void, Never>?
     private var seriesTask: Task<Void, Never>?
     private var streamTask: Task<Void, Never>?
     private var epgTask: Task<Void, Never>?
@@ -118,11 +121,21 @@ final class AppState: ObservableObject {
         player.$state
             .removeDuplicates()
             .receive(on: RunLoop.main)
-            .sink { state in
+            .sink { [weak self] state in
                 AppLog.info("Player state: \(Self.describe(state))")
                 if case .failed(let message) = state {
                     AppLog.error("Player error: \(message)")
                 }
+                if state == .ended {
+                    self?.clearPlaybackProgressForCurrentMedia()
+                }
+            }
+            .store(in: &cancellables)
+
+        player.$currentTime
+            .throttle(for: .seconds(5), scheduler: RunLoop.main, latest: true)
+            .sink { [weak self] _ in
+                self?.savePlaybackProgress()
             }
             .store(in: &cancellables)
     }
@@ -180,6 +193,7 @@ final class AppState: ObservableObject {
         genresTask?.cancel()
         channelTask?.cancel()
         mediaTask?.cancel()
+        mediaPageTask?.cancel()
         seriesTask?.cancel()
         streamTask?.cancel()
         epgTask?.cancel()
@@ -339,6 +353,7 @@ final class AppState: ObservableObject {
         genresTask?.cancel()
         channelTask?.cancel()
         mediaTask?.cancel()
+        mediaPageTask?.cancel()
         seriesTask?.cancel()
         streamTask?.cancel()
         epgTask?.cancel()
@@ -378,6 +393,8 @@ final class AppState: ObservableObject {
         isRetryingGenres = false
         isLoadingMedia = false
         isLoadingMoreMedia = false
+        mediaCurrentPage = 1
+        mediaTotalPages = 1
         isLoadingSeriesDetail = false
         mediaLoadWarning = nil
         errorMessage = nil
@@ -419,9 +436,11 @@ final class AppState: ObservableObject {
             return
         }
 
+        savePlaybackProgress()
         genresTask?.cancel()
         channelTask?.cancel()
         mediaTask?.cancel()
+        mediaPageTask?.cancel()
         seriesTask?.cancel()
         streamTask?.cancel()
         epgTask?.cancel()
@@ -444,6 +463,8 @@ final class AppState: ObservableObject {
         mediaLoadWarning = nil
         isLoadingMedia = false
         isLoadingMoreMedia = false
+        mediaCurrentPage = 1
+        mediaTotalPages = 1
         isLoadingSeriesDetail = false
         isLoadingChannels = false
         isResolvingStream = false
@@ -648,6 +669,7 @@ final class AppState: ObservableObject {
 
     private func loadMedia(for genre: StalkerGenre) {
         mediaTask?.cancel()
+        mediaPageTask?.cancel()
         seriesTask?.cancel()
         streamTask?.cancel()
         player.stop()
@@ -660,6 +682,8 @@ final class AppState: ObservableObject {
         selectedEpisode = nil
         isLoadingMedia = true
         isLoadingMoreMedia = false
+        mediaCurrentPage = 1
+        mediaTotalPages = 1
         mediaLoadWarning = nil
         isLoadingSeriesDetail = false
         isResolvingStream = false
@@ -690,39 +714,18 @@ final class AppState: ObservableObject {
                 let filter: (StalkerMediaItem) -> Bool = { item in
                     loadMode == .movies ? item.isMovie : item.isSeries
                 }
-                var loaded = first.items.filter(filter)
-                var seen = Set(loaded.map { "\($0.kind.rawValue):\($0.id)" })
+                let loaded = first.items.filter(filter)
                 self.mediaItems = loaded
                 self.isLoadingMedia = false
                 AppLog.info("Loaded VOD page 1: \(first.items.count) raw, \(loaded.count) \(loadMode.title); total pages \(first.totalPages)")
 
                 let totalPages = min(max(first.totalPages, 1), configurationMaxVODPages)
-                if totalPages > 1 {
-                    self.isLoadingMoreMedia = true
-                    for page in 2...totalPages {
-                        guard self.activePortal?.id == portalID,
-                              self.contentMode == loadMode,
-                              self.selectedGenre?.id == genre.id,
-                              !Task.isCancelled else { return }
-                        do {
-                            let next = try await client.fetchVODPage(categoryID: genre.id, page: page)
-                            let newItems = next.items.filter(filter).filter {
-                                seen.insert("\($0.kind.rawValue):\($0.id)").inserted
-                            }
-                            loaded.append(contentsOf: newItems)
-                            self.mediaItems = loaded
-                            if page % 5 == 0 || page == totalPages {
-                                AppLog.info("Loaded VOD page \(page)/\(totalPages), \(loaded.count) visible items")
-                            }
-                        } catch {
-                            if case StalkerError.cancelled = error { return }
-                            AppLog.warning("VOD page \(page) failed for '\(genre.title)': \(error.localizedDescription)")
-                            self.mediaLoadWarning = "Some titles could not be loaded. Pull to refresh or try again."
-                            break
-                        }
-                    }
-                    self.isLoadingMoreMedia = false
-                }
+                self.mediaCurrentPage = 1
+                self.mediaTotalPages = totalPages
+                self.isLoadingMoreMedia = false
+                // Later pages are fetched only when the user reaches the end
+                // of the grid. Firing every page in the background starves the
+                // portal's create_link endpoint and made titles fail to play.
             } catch {
                 guard self.activePortal?.id == portalID,
                       self.contentMode == loadMode,
@@ -738,7 +741,62 @@ final class AppState: ObservableObject {
     }
 
     private var configurationMaxVODPages: Int {
-        40
+        60
+    }
+
+    var canLoadMoreMedia: Bool {
+        mediaCurrentPage < mediaTotalPages
+    }
+
+    func loadMoreMedia() {
+        guard canLoadMoreMedia,
+              !isLoadingMoreMedia,
+              let client,
+              let portalID = activePortal?.id,
+              let genre = selectedGenre,
+              contentMode != .live else { return }
+
+        let loadMode = contentMode
+        let nextPage = mediaCurrentPage + 1
+        let filter: (StalkerMediaItem) -> Bool = { item in
+            loadMode == .movies ? item.isMovie : item.isSeries
+        }
+
+        isLoadingMoreMedia = true
+        mediaPageTask?.cancel()
+        mediaPageTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let next = try await client.fetchVODPage(categoryID: genre.id, page: nextPage)
+                guard self.activePortal?.id == portalID,
+                      self.contentMode == loadMode,
+                      self.selectedGenre?.id == genre.id,
+                      !Task.isCancelled else { return }
+
+                let existing = Set(self.mediaItems.map { "\($0.kind.rawValue):\($0.id)" })
+                var seen = existing
+                let newItems = next.items.filter(filter).filter {
+                    seen.insert("\($0.kind.rawValue):\($0.id)").inserted
+                }
+                self.mediaItems.append(contentsOf: newItems)
+                self.mediaCurrentPage = nextPage
+                self.isLoadingMoreMedia = false
+                AppLog.info("Loaded VOD page \(nextPage)/\(self.mediaTotalPages), \(self.mediaItems.count) visible items")
+            } catch {
+                guard self.activePortal?.id == portalID,
+                      self.contentMode == loadMode,
+                      self.selectedGenre?.id == genre.id,
+                      !Task.isCancelled else { return }
+                self.isLoadingMoreMedia = false
+                if case StalkerError.cancelled = error { return }
+                AppLog.warning("VOD page \(nextPage) failed for '\(genre.title)': \(error.localizedDescription)")
+                if case StalkerError.rateLimited = error {
+                    self.mediaLoadWarning = "The portal is rate-limiting requests. Tap Load More to retry."
+                } else {
+                    self.mediaLoadWarning = "Some titles could not be loaded. Tap Load More to retry."
+                }
+            }
+        }
     }
 
     /// Stalker exposes one VOD category list containing both movies and series.
@@ -769,6 +827,7 @@ final class AppState: ObservableObject {
         guard contentMode != .live else { return }
         guard selectedMedia?.id != media.id || selectedEpisode != nil else { return }
 
+        savePlaybackProgress()
         selectedMedia = media
         selectedEpisode = nil
         seasons = []
@@ -780,21 +839,27 @@ final class AppState: ObservableObject {
         errorMessage = nil
 
         if media.isMovie {
-            resolveAndPlay(media, title: media.name, subtitle: "Movie")
+            resolveAndPlay(media, title: media.name, subtitle: "Movie", useResume: true)
         } else if media.isSeries {
             loadSeasons(for: media)
         }
     }
 
-    func playSelectedMedia() {
+    func playSelectedMedia(useResume: Bool = true) {
         guard let selectedMedia else { return }
         if selectedMedia.isMovie {
-            resolveAndPlay(selectedMedia, title: selectedMedia.name, subtitle: "Movie")
+            resolveAndPlay(
+                selectedMedia,
+                title: selectedMedia.name,
+                subtitle: "Movie",
+                useResume: useResume
+            )
         } else if let selectedEpisode {
             resolveAndPlay(
                 selectedEpisode,
                 title: selectedMedia.name,
-                subtitle: selectedEpisode.name
+                subtitle: selectedEpisode.name,
+                useResume: useResume
             )
         }
     }
@@ -895,25 +960,50 @@ final class AppState: ObservableObject {
 
     func selectEpisode(_ episode: StalkerMediaItem) {
         guard let series = selectedMedia, series.isSeries else { return }
+        savePlaybackProgress()
         selectedEpisode = episode
         resolveAndPlay(
             episode,
             title: series.name,
-            subtitle: episode.name
+            subtitle: episode.name,
+            useResume: true
         )
     }
 
-    private func resolveAndPlay(_ media: StalkerMediaItem, title: String, subtitle: String) {
+    private func resolveAndPlay(
+        _ media: StalkerMediaItem,
+        title: String,
+        subtitle: String,
+        useResume: Bool
+    ) {
         guard let client, let portalID = activePortal?.id else { return }
 
+        // Don't compete with catalog pagination for the portal's API limits
+        // when the user presses Play.
+        mediaPageTask?.cancel()
+        isLoadingMoreMedia = false
         streamTask?.cancel()
         isResolvingStream = true
         player.stop()
 
+        let resumeAt: Double? = {
+            guard useResume,
+                  let entry = PlaybackProgressStore.entry(portalID: portalID, mediaID: media.id),
+                  entry.position > 5 else { return nil }
+            if entry.duration > 0, entry.position >= entry.duration - 15 {
+                return nil
+            }
+            return entry.position
+        }()
+
+        if let resumeAt {
+            AppLog.info("Resuming '\(media.name)' at \(Int(resumeAt))s")
+        }
+
         streamTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let stream = try await client.resolveStream(for: media)
+                let stream = try await Self.resolveStreamWithRetry(client: client, media: media)
                 guard self.activePortal?.id == portalID,
                       self.selectedMedia?.id == media.movieID
                         || self.selectedMedia?.id == media.id
@@ -928,7 +1018,8 @@ final class AppState: ObservableObject {
                     title: title,
                     subtitle: subtitle,
                     channelID: media.id,
-                    isLive: false
+                    isLive: false,
+                    startTime: resumeAt
                 ))
             } catch {
                 guard self.activePortal?.id == portalID,
@@ -1069,6 +1160,111 @@ final class AppState: ObservableObject {
         session?.userProfile.displayName ?? activePortal?.name ?? "No portal"
     }
 
+    // MARK: Resume playback
+
+    func resumePosition(for media: StalkerMediaItem) -> Double? {
+        guard let portalID = activePortal?.id,
+              let entry = PlaybackProgressStore.entry(portalID: portalID, mediaID: media.id),
+              entry.position > 5 else { return nil }
+        if entry.duration > 0, entry.position >= entry.duration - 15 { return nil }
+        return entry.position
+    }
+
+    func latestResume(for series: StalkerMediaItem) -> PlaybackProgress? {
+        guard let portalID = activePortal?.id else { return nil }
+        let movieID = series.movieID ?? series.id
+        guard let entry = PlaybackProgressStore.latest(portalID: portalID, movieID: movieID),
+              entry.position > 5 else { return nil }
+        if entry.duration > 0, entry.position >= entry.duration - 15 { return nil }
+        return entry
+    }
+
+    func resumeLatest(for series: StalkerMediaItem) {
+        guard let entry = latestResume(for: series) else { return }
+        let episode = StalkerMediaItem(
+            id: entry.mediaID,
+            name: entry.title,
+            kind: .episode,
+            movieID: entry.movieID ?? (series.movieID ?? series.id),
+            seasonID: entry.seasonID,
+            episodeID: entry.episodeID
+        )
+        selectedMedia = series
+        selectedEpisode = episode
+        resolveAndPlay(episode, title: series.name, subtitle: entry.title, useResume: true)
+    }
+
+    private static func resolveStreamWithRetry(
+        client: StalkerClient,
+        media: StalkerMediaItem
+    ) async throws -> ResolvedStream {
+        do {
+            return try await client.resolveStream(for: media)
+        } catch let error as StalkerError {
+            if case .rateLimited = error {
+                AppLog.warning("Rate-limited while resolving VOD; retrying once in 4s")
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                return try await client.resolveStream(for: media)
+            }
+            throw error
+        }
+    }
+
+    private func savePlaybackProgress() {
+        guard contentMode != .live,
+              let portalID = activePortal?.id,
+              let request = player.currentRequest,
+              !request.isLive,
+              player.currentTime > 8 else { return }
+
+        let position = player.currentTime
+        let duration = player.duration
+        let media: StalkerMediaItem
+        let parentTitle: String
+
+        if let episode = selectedEpisode {
+            // Never attribute the previous item's playhead to a newly selected
+            // episode while a switch is in progress.
+            guard request.channelID == episode.id else { return }
+            media = episode
+            parentTitle = selectedMedia?.name ?? request.title
+        } else if let movie = selectedMedia, movie.isMovie {
+            guard request.channelID == movie.id else { return }
+            media = movie
+            parentTitle = ""
+        } else {
+            return
+        }
+
+        if duration > 0, position >= duration - 15 {
+            PlaybackProgressStore.remove(portalID: portalID, mediaID: media.id)
+            return
+        }
+
+        let progress = PlaybackProgress(
+            portalID: portalID,
+            mediaID: media.id,
+            movieID: media.movieID ?? (media.isMovie ? media.id : selectedMedia?.id),
+            seasonID: media.seasonID,
+            episodeID: media.episodeID ?? (media.isEpisode ? media.id : nil),
+            title: media.name,
+            parentTitle: parentTitle,
+            position: position,
+            duration: duration,
+            updatedAt: Date()
+        )
+        PlaybackProgressStore.save(progress)
+    }
+
+    private func clearPlaybackProgressForCurrentMedia() {
+        guard let portalID = activePortal?.id else { return }
+        if let episode = selectedEpisode {
+            PlaybackProgressStore.remove(portalID: portalID, mediaID: episode.id)
+        } else if let movie = selectedMedia, movie.isMovie {
+            PlaybackProgressStore.remove(portalID: portalID, mediaID: movie.id)
+        }
+    }
+
     var isVideoMode: Bool {
         contentMode == .movies || contentMode == .series
     }
@@ -1112,6 +1308,7 @@ final class AppState: ObservableObject {
     }
 
     func dismissDetail() {
+        savePlaybackProgress()
         streamTask?.cancel()
         epgTask?.cancel()
         seriesTask?.cancel()

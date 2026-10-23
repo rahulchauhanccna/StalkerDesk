@@ -80,6 +80,14 @@ final class AVPlayerEngine: NSObject, PlaybackEngine {
         item = newItem
         player.replaceCurrentItem(with: newItem)
 
+        if let startTime = request.startTime, startTime > 1 {
+            player.seek(
+                to: CMTime(seconds: startTime, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+
         observeItem(newItem)
         addPeriodicTimeObserver()
         addPlaybackNotifications(for: newItem)

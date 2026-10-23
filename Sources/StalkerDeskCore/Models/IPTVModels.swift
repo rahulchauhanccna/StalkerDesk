@@ -433,6 +433,8 @@ public struct PlaybackRequest: Hashable, Sendable {
     public let channelID: String?
     public let isLive: Bool
     public let preferredEngine: PlaybackEnginePreference
+    /// Optional resume position in seconds. Ignored for live streams.
+    public let startTime: Double?
 
     public init(
         url: URL,
@@ -441,7 +443,8 @@ public struct PlaybackRequest: Hashable, Sendable {
         subtitle: String = "",
         channelID: String? = nil,
         isLive: Bool = true,
-        preferredEngine: PlaybackEnginePreference = .automatic
+        preferredEngine: PlaybackEnginePreference = .automatic,
+        startTime: Double? = nil
     ) {
         self.url = url
         self.headers = headers
@@ -450,6 +453,7 @@ public struct PlaybackRequest: Hashable, Sendable {
         self.channelID = channelID
         self.isLive = isLive
         self.preferredEngine = preferredEngine
+        self.startTime = startTime
     }
 
     /// The player layer and VLCKit should never receive credentials accidentally

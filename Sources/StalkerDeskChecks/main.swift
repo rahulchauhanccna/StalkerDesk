@@ -72,6 +72,48 @@ final class VODDumpTransport: StalkerHTTPTransport, @unchecked Sendable {
     }
 }
 
+final class VODResolveDumpTransport: StalkerHTTPTransport, @unchecked Sendable {
+    private let inner = URLSessionStalkerTransport()
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let result = try await inner.send(request)
+        let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+        let query = Dictionary(uniqueKeysWithValues: (components?.queryItems ?? []).map { ($0.name, $0.value ?? "") })
+        let action = query["action"] ?? ""
+        if query["type"] == "vod" {
+            let detail = ["action", "movie_id", "season_id", "episode_id", "category", "cmd", "p", "sortby"]
+                .compactMap { key in query[key].map { "\(key)=\($0)" } }
+                .joined(separator: " ")
+            print("  [http] \(detail)")
+            Self.inspect(result.0, action: action)
+        }
+        return result
+    }
+
+    private static func inspect(_ data: Data, action: String) {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let js = root["js"] as? [String: Any] else {
+            print("    [response] \(String(data: data.prefix(500), encoding: .utf8) ?? "<binary>")")
+            return
+        }
+        if let rows = js["data"] as? [[String: Any]], let first = rows.first {
+            print("    [response] rows=\(rows.count) total_items=\(js["total_items"] ?? "?")")
+            let keys = ["id", "movie_id", "video_id", "name", "cmd", "file", "path", "protocol", "rtsp_url", "is_series", "series", "category_id", "has_files"]
+            for key in keys {
+                if let value = first[key] {
+                    print("      \(key) = \(String(describing: value))")
+                }
+            }
+        } else {
+            let text = String(data: data, encoding: .utf8) ?? "<binary>"
+            print("    [response] \(text.prefix(1200))")
+        }
+        if action == "create_link", let command = js["cmd"] ?? js["url"] {
+            print("    [create_link cmd] \(String(describing: command))")
+        }
+    }
+}
+
 // MARK: - Portal mock
 
 struct MockResponse: Sendable {
@@ -573,6 +615,80 @@ func runVODFieldDumpIfRequested() async {
     }
 }
 
+func runVODResolveDumpIfRequested() async {
+    let environment = ProcessInfo.processInfo.environment
+    guard environment["STALKERDESK_LIVE_RESOLVE_TITLE"] != nil
+        || environment["STALKERDESK_LIVE_RESOLVE_ID"] != nil else { return }
+    guard let portalURL = environment["STALKERDESK_LIVE_PORTAL"],
+          let macAddress = environment["STALKERDESK_LIVE_MAC"] else { return }
+
+    let client = StalkerClient(
+        configuration: StalkerClientConfiguration(enableSessionCache: false),
+        transport: VODResolveDumpTransport(),
+        sessionCache: nil
+    )
+    let profile = PortalProfile(
+        name: "Resolve dump",
+        portalURL: portalURL,
+        macAddress: macAddress,
+        timezone: environment["STALKERDESK_LIVE_TIMEZONE"] ?? TimeZone.current.identifier
+    )
+
+    do {
+        _ = try await client.connect(profile: profile, credentials: nil)
+        if let directID = environment["STALKERDESK_LIVE_RESOLVE_ID"] {
+            let item = StalkerMediaItem(
+                id: directID,
+                name: environment["STALKERDESK_LIVE_RESOLVE_TITLE"] ?? "Direct VOD item",
+                kind: .movie
+            )
+            do {
+                let stream = try await client.resolveStream(for: item)
+                print("  direct ID \(directID) resolved: \(stream.url.absoluteString)")
+            } catch {
+                print("  direct ID \(directID) resolve failed: \(error.localizedDescription)")
+            }
+            return
+        }
+        let categories = try await client.fetchVODCategories()
+        let categoryNeedle = environment["STALKERDESK_LIVE_VOD_CATEGORY"] ?? "NEW RELEASE"
+        guard let category = categories.first(where: { $0.title.localizedCaseInsensitiveContains(categoryNeedle) }) else {
+            print("No category matching \(categoryNeedle)")
+            return
+        }
+        let title = environment["STALKERDESK_LIVE_RESOLVE_TITLE"]!
+        let pageCount = Int(environment["STALKERDESK_LIVE_FIND_PAGES"] ?? "1") ?? 1
+        var found: StalkerMediaItem?
+        for pageNumber in 1...max(pageCount, 1) {
+            let page = try await client.fetchVODPage(categoryID: category.id, page: pageNumber)
+            if let item = page.items.first(where: { $0.name.localizedCaseInsensitiveContains(title) }) {
+                found = item
+                print("  found on page \(pageNumber)")
+                break
+            }
+            if pageNumber == 1 {
+                print("  page 1 titles: \(page.items.map(\.name).joined(separator: " | "))")
+            }
+        }
+        guard let item = found else {
+            print("No title matching \(title) in \(pageCount) page(s)")
+            return
+        }
+        print("  item: \(item.name)")
+        print("    id=\(item.id) movieID=\(item.movieID ?? "nil") seasonID=\(item.seasonID ?? "nil") episodeID=\(item.episodeID ?? "nil") kind=\(item.kind.rawValue)")
+        print("    cmd=\(item.command) category=\(item.categoryID ?? "nil")")
+        do {
+            let stream = try await client.resolveStream(for: item)
+            print("  resolved stream: \(stream.url.absoluteString)")
+            print("  host: \(stream.url.host ?? "nil")")
+        } catch {
+            print("  resolve failed: \(error.localizedDescription)")
+        }
+    } catch {
+        print("Resolve dump failed: \(error.localizedDescription)")
+    }
+}
+
 func runLivePortalDiagnosticIfRequested() async {
     let environment = ProcessInfo.processInfo.environment
     guard environment["STALKERDESK_LIVE_CHECK"] == "1" else { return }
@@ -673,6 +789,11 @@ func runLivePortalDiagnosticIfRequested() async {
 @main
 struct CheckRunner {
     static func main() async {
+        if ProcessInfo.processInfo.environment["STALKERDESK_LIVE_RESOLVE_TITLE"] != nil
+            || ProcessInfo.processInfo.environment["STALKERDESK_LIVE_RESOLVE_ID"] != nil {
+            await runVODResolveDumpIfRequested()
+            exit(0)
+        }
         if ProcessInfo.processInfo.environment["STALKERDESK_LIVE_DUMP_VOD"] == "1" {
             await runVODFieldDumpIfRequested()
             exit(0)
